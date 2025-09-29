@@ -1,7 +1,7 @@
 /**
  * bot.js — Tool_Auto_Trade (CLEAN)
  *
- * - Auto-scan every 10 minutes (AUTO_INTERVAL_MIN = 10)
+ * - Auto-scan every AUTO_INTERVAL_MIN minutes (default 10)
  * - Uses ICT primitives: BOS, FVG, OB, Liquidity, Candle patterns
  * - Compares new signals with last saved signals -> send only stronger or resend previous if stronger
  * - Watchlist, permissions (grant/revoke), announce, history
@@ -12,7 +12,7 @@
  *
  * DEPLOY NOTES:
  * - Set TELEGRAM_TOKEN and ADMIN_ID as environment variables on Render
- * - Start command: "npm start" with package.json having "start": "node bot.js"
+ * - Start command: "npm start"
  */
 
 const fs = require('fs');
@@ -22,19 +22,436 @@ const express = require('express');
 const TelegramBot = require('node-telegram-bot-api');
 
 // ---------------- CONFIG ----------------
-const TOKEN = process.env.TELEGRAM_TOKEN || '';
-const ADMIN_ID = String(process.env.ADMIN_ID || '');
+const TOKEN = process.env.TELEGRAM_TOKEN || ''; // set on Render
+const ADMIN_ID = String(process.env.ADMIN_ID || ''); // set on Render
 const AUTO_INTERVAL_MIN = Number(process.env.AUTO_INTERVAL_MIN || 10);
 const AUTO_COINS = (process.env.AUTO_COINS || 'BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,BNBUSDT')
   .split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
 
 const BOT_NAME = 'Tool_Auto_Trade';
 
+// quick env check
 if (!TOKEN || !ADMIN_ID) {
-  console.error('Missing TELEGRAM_TOKEN or ADMIN_ID environment variable. Set them before start.');
+  console.error('Missing TELEGRAM_TOKEN or ADMIN_ID environment variables. Set them before start.');
   process.exit(1);
 }
 
+// ---------------- DATA FILES & HELPERS ----------------
+const DATA_DIR = path.join(__dirname, '.data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
+const WATCH_FILE = path.join(DATA_DIR, 'watchlist.json');
+const PERMS_FILE = path.join(DATA_DIR, 'permissions.json');
+const LAST_SIGNALS_FILE = path.join(DATA_DIR, 'last_signals.json');
+
+// ensure files exist
+if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, JSON.stringify([]));
+if (!fs.existsSync(WATCH_FILE)) fs.writeFileSync(WATCH_FILE, JSON.stringify({}));
+if (!fs.existsSync(PERMS_FILE)) fs.writeFileSync(PERMS_FILE, JSON.stringify({ admins: [ADMIN_ID], users: [] }));
+if (!fs.existsSync(LAST_SIGNALS_FILE)) fs.writeFileSync(LAST_SIGNALS_FILE, JSON.stringify({}));
+
+function readJSON(filePath, def = {}) {
+  try {
+    const raw = fs.readFileSync(filePath, 'utf8');
+    if (!raw) return def;
+    return JSON.parse(raw);
+  } catch (e) {
+    return def;
+  }
+}
+function writeJSON(filePath, obj) {
+  fs.writeFileSync(filePath, JSON.stringify(obj, null, 2));
+}
+
+// wrappers
+function readHistory() { return readJSON(HISTORY_FILE, []); }
+function saveHistory(arr) { writeJSON(HISTORY_FILE, arr); }
+function readWatch() { return readJSON(WATCH_FILE, {}); }
+function saveWatch(obj) { writeJSON(WATCH_FILE, obj); }
+function readPerms() { return readJSON(PERMS_FILE, { admins: [ADMIN_ID], users: [] }); }
+function savePerms(obj) { writeJSON(PERMS_FILE, obj); }
+function readLastSignals() { return readJSON(LAST_SIGNALS_FILE, {}); }
+function saveLastSignals(obj) { writeJSON(LAST_SIGNALS_FILE, obj); }
+
+// ---------------- TELEGRAM BOT ----------------
+const bot = new TelegramBot(TOKEN, { polling: true });
+
+// ---------------- BINANCE FETCH ----------------
+async function fetchKlines(symbol, interval = '15m', limit = 300) {
+  try {
+    const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    const res = await axios.get(url, { timeout: 15000 });
+    return res.data.map(c => ({
+      t: c[0],
+      open: parseFloat(c[1]),
+      high: parseFloat(c[2]),
+      low: parseFloat(c[3]),
+      close: parseFloat(c[4]),
+      vol: parseFloat(c[5])
+    }));
+  } catch (e) {
+    console.warn('fetchKlines error', symbol, e && e.message ? e.message : e);
+    return [];
+  }
+}
+
+// ---------------- DETECTORS ----------------
+function detectBOS(candles, lookback = 20) {
+  if (!candles || candles.length < lookback) return null;
+  const slice = candles.slice(-lookback);
+  const last = slice[slice.length - 1];
+  const highs = slice.map(c => c.high);
+  const lows = slice.map(c => c.low);
+  const recentHigh = Math.max(...highs.slice(0, -1));
+  const recentLow = Math.min(...lows.slice(0, -1));
+  if (last.close > recentHigh) return { type: 'BOS_UP', price: last.close };
+  if (last.close < recentLow) return { type: 'BOS_DOWN', price: last.close };
+  return null;
+}
+
+function detectOrderBlock(candles) {
+  if (!candles || candles.length < 6) return { bullish: null, bearish: null };
+  const last5 = candles.slice(-6, -1);
+  const blocks = { bullish: null, bearish: null };
+  for (const c of last5) {
+    const body = Math.abs(c.close - c.open);
+    const range = c.high - c.low || 1;
+    if (body > range * 0.6) {
+      if (c.close > c.open) blocks.bullish = c;
+      else blocks.bearish = c;
+    }
+  }
+  return blocks;
+}
+
+function detectFVG(candles) {
+  if (!candles || candles.length < 5) return null;
+  for (let i = candles.length - 3; i >= 2; i--) {
+    const c = candles[i], c2 = candles[i - 2];
+    if (!c || !c2) continue;
+    if (c.low > c2.high) return { type: 'FVG_UP', idx: i, low: c2.high, high: c.low };
+    if (c.high < c2.low) return { type: 'FVG_DOWN', idx: i, low: c.high, high: c2.low };
+  }
+  return null;
+}
+
+function detectSweep(candles) {
+  if (!candles || candles.length < 3) return null;
+  const last = candles[candles.length - 1], prev = candles[candles.length - 2];
+  if (last.high > prev.high && last.close < prev.close) return 'LIQUIDITY_SWEEP_TOP';
+  if (last.low < prev.low && last.close > prev.close) return 'LIQUIDITY_SWEEP_BOTTOM';
+  return null;
+}
+
+function detectCandlePattern(candles) {
+  const n = candles ? candles.length : 0;
+  if (n < 2) return null;
+  const last = candles[n - 1], prev = candles[n - 2];
+  const body = Math.abs(last.close - last.open);
+  const range = last.high - last.low || 1;
+  const upper = last.high - Math.max(last.open, last.close);
+  const lower = Math.min(last.open, last.close) - last.low;
+  if (body < range * 0.3 && upper > lower * 2) return 'ShootingStar';
+  if (body < range * 0.3 && lower > upper * 2) return 'Hammer';
+  if (last.close > prev.open && last.open < prev.close && last.close > last.open) return 'BullishEngulfing';
+  if (last.close < prev.open && last.open > prev.close && last.close < last.open) return 'BearishEngulfing';
+  return null;
+}
+
+function detectLiquidityZone(candles) {
+  if (!candles || candles.length < 10) return null;
+  const recent = candles.slice(-30);
+  const vols = recent.map(c => c.vol || 0);
+  const avg = vols.reduce((s, v) => s + v, 0) / Math.max(1, vols.length);
+  const last = recent[recent.length - 1];
+  if (last && last.vol > avg * 1.8) return { type: 'LIQUIDITY_ZONE', vol: last.vol, avgVol: avg };
+  return null;
+}
+
+// ---------------- IDEA ENGINE ----------------
+function scoreIdea({ bos, fvg, ob, pattern, liq }) {
+  let score = 0;
+  if (bos) score += 3;
+  if (fvg) score += 3;
+  if (ob && (ob.bullish || ob.bearish)) score += 2;
+  if (liq) score += 1;
+  if (pattern) score += 1;
+  return score;
+}
+
+function generateIdea(symbol, price, bos, fvg, ob, pattern, liq) {
+  let dir = null;
+  if (bos && bos.type === 'BOS_UP') dir = 'LONG';
+  if (bos && bos.type === 'BOS_DOWN') dir = 'SHORT';
+  const score = scoreIdea({ bos, fvg, ob, pattern, liq });
+
+  // strict conditions for strong signal
+  const ok = dir && fvg && (ob && (ob.bullish || ob.bearish)) && liq && score >= 6;
+  if (!ok) return { ok: false, reason: 'Not enough confluence', score };
+
+  const entry = price;
+  const sl = dir === 'LONG' ? +(price * 0.99).toFixed(6) : +(price * 1.01).toFixed(6);
+  const tp = dir === 'LONG' ? +(price * 1.02).toFixed(6) : +(price * 0.98).toFixed(6);
+  const rr = Math.abs((tp - entry) / (entry - sl)).toFixed(2);
+  const note = `${bos ? bos.type : ''} ${fvg ? fvg.type : ''} ${ob.bullish ? 'OB_BULL' : ''} ${ob.bearish ? 'OB_BEAR' : ''} ${pattern || ''} ${liq ? liq.type : ''}`.trim();
+
+  return { ok: true, symbol, dir, entry, sl, tp, rr, note, score };
+}
+
+// ---------------- FULL ANALYSIS ----------------
+async function fullAnalysis(symbol) {
+  const kl15 = await fetchKlines(symbol, '15m', 300);
+  if (!kl15 || !kl15.length) return { ok: false, reason: 'no data' };
+
+  const kl1h = await fetchKlines(symbol, '1h', 200);
+  const kl4h = await fetchKlines(symbol, '4h', 200);
+  const price = kl15[kl15.length - 1].close;
+
+  const bos15 = detectBOS(kl15, 20);
+  const ob15 = detectOrderBlock(kl15);
+  const fvg15 = detectFVG(kl15);
+  const sweep15 = detectSweep(kl15);
+  const pattern15 = detectCandlePattern(kl15);
+  const liq15 = detectLiquidityZone(kl15);
+
+  const bos1h = (kl1h && kl1h.length) ? detectBOS(kl1h, 20) : null;
+  const bos4h = (kl4h && kl4h.length) ? detectBOS(kl4h, 12) : null;
+
+  const idea = generateIdea(symbol, price, bos15, fvg15, ob15, pattern15, liq15);
+
+  return { ok: true, symbol, price, bos15, bos1h, bos4h, ob15, fvg15, sweep15, pattern15, liq15, idea };
+}
+
+// ---------------- HISTORY ----------------
+function pushHistoryRecord(rec) {
+  const arr = readHistory();
+  rec._time = Date.now();
+  arr.unshift(rec);
+  if (arr.length > 2000) arr.splice(2000);
+  saveHistory(arr);
+}
+
+// ---------------- AUTO SCAN ----------------
+async function autoScanAll() {
+  try {
+    const lastSignals = readLastSignals();
+
+    for (const s of AUTO_COINS) {
+      const r = await fullAnalysis(s);
+      if (!r.ok) continue;
+      const newIdea = r.idea;
+      const prev = lastSignals[s];
+
+      // if new idea weak but prev stronger and older than 5 min -> resend prev
+      if (!newIdea.ok) {
+        if (prev && prev.score > (newIdea.score || 0) && (Date.now() - (prev._time || 0) > 5 * 60000)) {
+          // resend previous strong sig
+          try {
+            await bot.sendMessage(ADMIN_ID, `🔁 Resending previous stronger signal for ${s}:\n${prev.dir} Entry:${prev.entry} SL:${prev.sl} TP:${prev.tp}\nScore:${prev.score}\nNote:${prev.note}`);
+            prev._time = Date.now();
+            lastSignals[s] = prev;
+            saveLastSignals(lastSignals);
+          } catch (err) {
+            console.error('Error resending previous signal', err);
+          }
+        }
+        continue;
+      }
+
+      // newIdea.ok === true -> send if stronger or no prev
+      if (!prev || newIdea.score >= prev.score) {
+        try {
+          await bot.sendMessage(ADMIN_ID, `🤖 Auto-scan ${s}\n${newIdea.dir}\nEntry:${newIdea.entry}\nSL:${newIdea.sl}\nTP:${newIdea.tp}\nRR:${newIdea.rr}\nScore:${newIdea.score}\nNote:${newIdea.note}`);
+        } catch (err) {
+          console.error('Error sending auto signal', err);
+        }
+        pushHistoryRecord({ auto: true, symbol: s, analysis: r, idea: newIdea });
+        lastSignals[s] = { ...newIdea, _time: Date.now() };
+        saveLastSignals(lastSignals);
+      } else {
+        // optionally resend prev if still relevant and old
+        if (prev && (Date.now() - (prev._time || 0) > 10 * 60000)) {
+          try {
+            await bot.sendMessage(ADMIN_ID, `🔁 Previous strong signal still relevant for ${s}:\n${prev.dir} Entry:${prev.entry} SL:${prev.sl} TP:${prev.tp}\nScore:${prev.score}`);
+            prev._time = Date.now();
+            lastSignals[s] = prev;
+            saveLastSignals(lastSignals);
+          } catch (err) {
+            console.error('Error resending prev strong', err);
+          }
+        }
+      }
+    }
+
+    // per-user watchlist notifications for users with permission
+    const watch = readWatch();
+    const perms = readPerms();
+    for (const userId of (perms.users || [])) {
+      const list = (watch[String(userId)] || []);
+      for (const s of list) {
+        const r = await fullAnalysis(s);
+        if (r.idea && r.idea.ok) {
+          const i = r.idea;
+          try {
+            await bot.sendMessage(String(userId), `🔔 Watchlist alert ${s}\n${i.dir} Entry:${i.entry} SL:${i.sl} TP:${i.tp}\nScore:${i.score}\nNote:${i.note}`);
+            pushHistoryRecord({ auto: true, symbol: s, analysis: r, idea: i, sentTo: String(userId) });
+          } catch (err) {
+            console.error('Error sending watchlist alert to', userId, err);
+          }
+        }
+      }
+    }
+
+  } catch (err) {
+    console.error('autoScanAll error', err && err.stack ? err.stack : err);
+  }
+}
+
+// ---------------- TELEGRAM COMMANDS ----------------
+// /start help
+bot.onText(/\/start/, (msg) => {
+  const chatId = String(msg.chat.id);
+  const help = `🤖 *${BOT_NAME}* ready.\nCommands:\n/scan SYMBOL - phân tích\n/watch SYMBOL - thêm watch\n/unwatch SYMBOL - xóa watch\n/signals - last signals\n/stats - thống kê\n/request - yêu cầu quyền\n/status - trạng thái\nAdmin only: /grant /revoke /announce\nAuto-scan every ${AUTO_INTERVAL_MIN} min for: ${AUTO_COINS.join(', ')}`;
+  bot.sendMessage(chatId, help, { parse_mode: 'Markdown' });
+});
+
+// /scan
+bot.onText(/\/scan (.+)/i, async (msg, match) => {
+  const chatId = String(msg.chat.id);
+  const symbol = (match[1] || '').trim().toUpperCase();
+  const perms = readPerms();
+  if (!perms.users.includes(chatId) && chatId !== ADMIN_ID) return bot.sendMessage(chatId, '❌ Bạn chưa được cấp quyền. Gửi /request');
+  const r = await fullAnalysis(symbol);
+  if (!r.ok) return bot.sendMessage(chatId, `❌ ${r.reason || 'No data'}`);
+  if (r.idea && r.idea.ok) {
+    const i = r.idea;
+    bot.sendMessage(chatId, `📊 ${symbol} -> ${i.dir}\nEntry:${i.entry}\nSL:${i.sl}\nTP:${i.tp}\nScore:${i.score}\nNote:${i.note}`);
+    pushHistoryRecord({ type: 'manual_scan', symbol, analysis: r, idea: i, user: chatId });
+  } else {
+    bot.sendMessage(chatId, `⚠️ Không đủ confluence cho ${symbol}. Score:${r.idea ? r.idea.score : 0}`);
+  }
+});
+
+// /watch and /unwatch
+bot.onText(/\/watch\s+(.+)/i, (msg, match) => {
+  const chatId = String(msg.chat.id);
+  const symbol = (match[1] || '').trim().toUpperCase();
+  const perms = readPerms();
+  if (!perms.users.includes(chatId) && chatId !== ADMIN_ID) return bot.sendMessage(chatId, '❌ Bạn chưa được cấp quyền.');
+  const watch = readWatch();
+  watch[chatId] = watch[chatId] || [];
+  if (!watch[chatId].includes(symbol)) {
+    watch[chatId].push(symbol);
+    saveWatch(watch);
+  }
+  bot.sendMessage(chatId, `✅ Đã thêm ${symbol} vào watchlist.`);
+});
+
+bot.onText(/\/unwatch\s+(.+)/i, (msg, match) => {
+  const chatId = String(msg.chat.id);
+  const symbol = (match[1] || '').trim().toUpperCase();
+  const perms = readPerms();
+  if (!perms.users.includes(chatId) && chatId !== ADMIN_ID) return bot.sendMessage(chatId, '❌ Bạn chưa được cấp quyền.');
+  const watch = readWatch();
+  watch[chatId] = (watch[chatId] || []).filter(x => x !== symbol);
+  saveWatch(watch);
+  bot.sendMessage(chatId, `🗑️ Đã xóa ${symbol} khỏi watchlist.`);
+});
+
+// /signals
+bot.onText(/\/signals/, (msg) => {
+  const chatId = String(msg.chat.id);
+  const last = readLastSignals();
+  const keys = Object.keys(last || {});
+  if (!keys.length) return bot.sendMessage(chatId, 'Chưa có tín hiệu nào được lưu.');
+  const out = keys.map(k => {
+    const s = last[k];
+    return `${k}: ${s.dir} Entry:${s.entry} SL:${s.sl} TP:${s.tp} Score:${s.score}`;
+  }).join('\n');
+  bot.sendMessage(chatId, `📡 Last signals:\n${out}`);
+});
+
+// /stats
+bot.onText(/\/stats/, (msg) => {
+  const chatId = String(msg.chat.id);
+  const hist = readHistory();
+  const total = hist.length;
+  const ideas = hist.filter(h => h.idea && h.idea.ok);
+  const ideaRate = total ? ((ideas.length / total) * 100).toFixed(2) : 0;
+  bot.sendMessage(chatId, `📊 Stats:\nTotal records: ${total}\nIdea rate: ${ideaRate}%\nIdeas: ${ideas.length}`);
+});
+
+// /request -> notify admin
+bot.onText(/\/request/, (msg) => {
+  const chatId = String(msg.chat.id);
+  bot.sendMessage(ADMIN_ID, `📥 Request access from ${chatId}. To grant run: /grant ${chatId}`);
+  bot.sendMessage(chatId, '✅ Yêu cầu đã gửi đến admin.');
+});
+
+// admin commands
+bot.onText(/\/grant\s+(.+)/i, (msg, match) => {
+  const from = String(msg.from && msg.from.id);
+  if (from !== String(ADMIN_ID)) return bot.sendMessage(from, '❌ Chỉ admin mới có quyền này.');
+  const target = String((match[1] || '').trim());
+  const perms = readPerms();
+  if (!perms.users.includes(target)) {
+    perms.users.push(target);
+    savePerms(perms);
+    bot.sendMessage(ADMIN_ID, `✅ Đã cấp quyền cho ${target}`);
+    bot.sendMessage(target, `🎉 Bạn đã được cấp quyền sử dụng ${BOT_NAME}.`);
+  } else {
+    bot.sendMessage(ADMIN_ID, `${target} đã có quyền rồi.`);
+  }
+});
+
+bot.onText(/\/revoke\s+(.+)/i, (msg, match) => {
+  const from = String(msg.from && msg.from.id);
+  if (from !== String(ADMIN_ID)) return bot.sendMessage(from, '❌ Chỉ admin mới có quyền này.');
+  const target = String((match[1] || '').trim());
+  const perms = readPerms();
+  perms.users = (perms.users || []).filter(x => x !== target);
+  savePerms(perms);
+  bot.sendMessage(ADMIN_ID, `🗑️ Đã thu hồi quyền của ${target}`);
+  bot.sendMessage(target, `⚠️ Quyền sử dụng ${BOT_NAME} đã bị thu hồi.`);
+});
+
+bot.onText(/\/announce\s+(.+)/i, (msg, match) => {
+  const from = String(msg.from && msg.from.id);
+  if (from !== String(ADMIN_ID)) return bot.sendMessage(from, '❌ Chỉ admin mới có quyền này.');
+  const text = match[1].trim();
+  const perms = readPerms();
+  const users = perms.users || [];
+  users.forEach((uid, i) => {
+    setTimeout(() => {
+      bot.sendMessage(uid, `📣 Announcement from admin:\n${text}`);
+    }, i * 50);
+  });
+  bot.sendMessage(ADMIN_ID, `✅ Sent announcement to ${users.length} users.`);
+});
+
+bot.onText(/\/status/, (msg) => {
+  const chatId = String(msg.chat.id);
+  const last = readLastSignals();
+  bot.sendMessage(chatId, `Bot: ${BOT_NAME}\nAuto-scan: every ${AUTO_INTERVAL_MIN} minutes\nWatchlist users: ${Object.keys(readWatch()).length}\nPerms users: ${(readPerms().users || []).length}\nLast signals saved for: ${Object.keys(last).join(', ') || 'none'}`);
+});
+
+// ---------------- STARTUP & HEALTH ----------------
+console.log(`${BOT_NAME} running... (polling)`);
+const app = express();
+app.get('/', (req, res) => res.send(`${BOT_NAME} is alive`));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('HTTP server listening on', PORT));
+
+// initial run + scheduler
+setTimeout(() => {
+  autoScanAll();
+  setInterval(autoScanAll, AUTO_INTERVAL_MIN * 60000);
+}, 3000);
+
+// ---------------- graceful handlers ----------------
+process.on('uncaughtException', (err) => console.error('uncaughtException', err && err.stack ? err.stack : err));
+process.on('unhandledRejection', (reason) => console.error('unhandledRejection', reason));
 // ---------------- DATA FILES & HELPERS ----------------
 const DATA_DIR = path.join(__dirname, '.data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
