@@ -1,14 +1,11 @@
 {
-  "name": "tool_auto_trade",
+  "name": "tool-auto-trade-bot",
   "version": "1.0.0",
-  "description": "Telegram bot tự động phân tích thị trường & gửi tín hiệu trade",
+  "description": "Telegram Auto Trade Analysis Bot",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
     "dev": "nodemon bot.js"
-  },
-  "engines": {
-    "node": ">=18 <23"
   },
   "dependencies": {
     "axios": "^1.7.4",
@@ -19,14 +16,16 @@
   "devDependencies": {
     "nodemon": "^3.1.0"
   },
+  "engines": {
+    "node": ">=18.x"
+  },
   "keywords": [
     "telegram",
     "bot",
+    "auto-trade",
     "crypto",
-    "auto",
-    "trade",
     "analysis"
   ],
-  "author": "Nguyen Bang",
+  "author": "",
   "license": "MIT"
 }
