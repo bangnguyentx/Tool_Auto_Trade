@@ -11,9 +11,9 @@
     "node": ">=18 <23"
   },
   "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
     "axios": "^1.7.4",
     "express": "^4.19.2",
-    "node-telegram-bot-api": "^0.64.0",
     "fs-extra": "^11.2.0"
   },
   "devDependencies": {
