@@ -401,7 +401,8 @@ app.get('/', (req, res) => res.send('Tool_Auto_Trade is alive'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, ()=> console.log('HTTP server listening', PORT));
 
-console.log('Tool_Auto_Trade running...');function readWatch(){ return readJSON(WATCHFILE, {}); }
+console.log('Tool_Auto_Trade running...');
+function readWatch(){ return readJSON(WATCHFILE, {}); }
 function saveWatch(obj){ writeJSON(WATCHFILE, obj); }
 function readPerms(){ return readJSON(PERMS_FILE, { users: [ADMIN_ID] }); }
 function savePerms(obj){ writeJSON(PERMS_FILE, obj); }
