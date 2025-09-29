@@ -1,5 +1,5 @@
 {
-  "name": "Tool_Auto_Trade",
+  "name": "tool-auto-trade",
   "version": "1.0.0",
   "main": "bot.js",
   "scripts": {
