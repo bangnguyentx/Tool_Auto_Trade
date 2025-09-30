@@ -1,20 +1,13 @@
 /**
- * bot.js — Tool_Auto_Trade (CLEAN FINAL)
+ * bot.js — Tool_Auto_Trade (PRO FINAL)
  *
- * ✅ Auto-scan mỗi X phút
- * ✅ Phân tích ICT primitives: BOS, FVG, OB, Liquidity, Candle patterns
+ * ✅ Auto-scan Futures/Forex mỗi X phút
+ * ✅ Phân tích ICT primitives: BOS, FVG, OB, Liquidity, Candle patterns, Sideway, Fake Break
  * ✅ Gửi tín hiệu Telegram nếu có setup tốt
  * ✅ Watchlist, phân quyền, announce, lịch sử
+ * ✅ Admin duyệt user mới
+ * ✅ Broadcast & group chat
  * ✅ Health server cho Render
- *
- * REQUIREMENTS:
- *   npm install node-telegram-bot-api axios express
- *
- * ENV:
- *   TELEGRAM_TOKEN=xxxx
- *   ADMIN_ID=xxxx
- *   AUTO_INTERVAL_MIN=10
- *   AUTO_COINS=BTCUSDT,ETHUSDT,...
  */
 
 const fs = require('fs');
@@ -42,7 +35,6 @@ const DATA_DIR = path.join(__dirname, '.data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
 
 const HISTORY_FILE = path.join(DATA_DIR, 'history.json');
-const WATCH_FILE = path.join(DATA_DIR, 'watchlist.json');
 const PERMS_FILE = path.join(DATA_DIR, 'permissions.json');
 const LAST_SIGNALS_FILE = path.join(DATA_DIR, 'last_signals.json');
 
@@ -50,7 +42,6 @@ function initFile(file, def) {
   if (!fs.existsSync(file)) fs.writeFileSync(file, JSON.stringify(def));
 }
 initFile(HISTORY_FILE, []);
-initFile(WATCH_FILE, {});
 initFile(PERMS_FILE, { admins: [ADMIN_ID], users: [] });
 initFile(LAST_SIGNALS_FILE, {});
 
@@ -121,6 +112,29 @@ function detectFVG(candles) {
   return null;
 }
 
+function detectSideway(candles, lookback = 30) {
+  const slice = candles.slice(-lookback);
+  const highs = slice.map(c => c.high);
+  const lows = slice.map(c => c.low);
+  const maxH = Math.max(...highs);
+  const minL = Math.min(...lows);
+  const range = maxH - minL;
+  const mid = (maxH + minL) / 2;
+  const lastClose = slice.at(-1).close;
+  if (range / mid < 0.015) return { type: 'SIDEWAY', mid, range };
+  return null;
+}
+
+function detectFakeBreak(candles, lookback = 15) {
+  const slice = candles.slice(-lookback);
+  const maxH = Math.max(...slice.map(c => c.high));
+  const minL = Math.min(...slice.map(c => c.low));
+  const last = slice.at(-1);
+  if (last.high > maxH && last.close < maxH) return { type: 'FAKE_BREAK_UP' };
+  if (last.low < minL && last.close > minL) return { type: 'FAKE_BREAK_DOWN' };
+  return null;
+}
+
 function detectLiquidity(candles) {
   const recent = candles.slice(-30);
   const vols = recent.map(c => c.vol);
@@ -144,27 +158,29 @@ function detectCandlePattern(candles) {
   return null;
 }
 
-function scoreIdea({ bos, fvg, ob, liq, pattern }) {
+function scoreIdea({ bos, fvg, ob, liq, pattern, sideway, fake }) {
   let score = 0;
   if (bos) score += 3;
   if (fvg) score += 3;
   if (ob?.bullish || ob?.bearish) score += 2;
   if (liq) score += 1;
   if (pattern) score += 1;
+  if (sideway) score -= 1; // tránh sideway
+  if (fake) score -= 1;
   return score;
 }
 
-function generateIdea(symbol, price, bos, fvg, ob, liq, pattern) {
+function generateIdea(symbol, price, bos, fvg, ob, liq, pattern, sideway, fake) {
   let dir = bos?.type === 'BOS_UP' ? 'LONG' : bos?.type === 'BOS_DOWN' ? 'SHORT' : null;
-  const score = scoreIdea({ bos, fvg, ob, liq, pattern });
-  if (!dir || !fvg || !(ob?.bullish || ob?.bearish) || !liq || score < 6)
+  const score = scoreIdea({ bos, fvg, ob, liq, pattern, sideway, fake });
+  if (!dir || !fvg || !(ob?.bullish || ob?.bearish) || !liq || score < 5)
     return { ok: false, reason: 'Not enough confluence', score };
 
   const entry = price;
   const sl = dir === 'LONG' ? +(price * 0.99).toFixed(6) : +(price * 1.01).toFixed(6);
   const tp = dir === 'LONG' ? +(price * 1.02).toFixed(6) : +(price * 0.98).toFixed(6);
   const rr = Math.abs((tp - entry) / (entry - sl)).toFixed(2);
-  const note = [bos?.type, fvg?.type, ob.bullish ? 'OB_BULL' : '', ob.bearish ? 'OB_BEAR' : '', pattern, liq?.type]
+  const note = [bos?.type, fvg?.type, ob.bullish ? 'OB_BULL' : '', ob.bearish ? 'OB_BEAR' : '', pattern, liq?.type, sideway?.type, fake?.type]
     .filter(Boolean).join(' ');
 
   return { ok: true, symbol, dir, entry, sl, tp, rr, note, score };
@@ -181,7 +197,9 @@ async function fullAnalysis(symbol) {
   const fvg = detectFVG(kl15);
   const liq = detectLiquidity(kl15);
   const pattern = detectCandlePattern(kl15);
-  const idea = generateIdea(symbol, price, bos, fvg, ob, liq, pattern);
+  const sideway = detectSideway(kl15);
+  const fake = detectFakeBreak(kl15);
+  const idea = generateIdea(symbol, price, bos, fvg, ob, liq, pattern, sideway, fake);
 
   return { ok: true, symbol, idea };
 }
@@ -219,20 +237,51 @@ async function autoScanAll() {
 // ---------------- TELEGRAM COMMANDS ----------------
 bot.onText(/\/start/, (msg) => {
   const chatId = String(msg.chat.id);
-  const help = `🤖 *${BOT_NAME}* ready.\nCommands:\n/scan SYMBOL\n/watch SYMBOL\n/unwatch SYMBOL\n/signals\n/stats\n/request\n/status`;
-  bot.sendMessage(chatId, help, { parse_mode: 'Markdown' });
+  const welcome = 
+`👋 *Chào mừng bạn đến với AI Phân Tích Thị Trường Pro*  
+
+🤖 Bot được xây dựng dựa trên chiến lược *Smart Money Concepts + ICT* giúp:
+• Phân tích chuẩn xác các vùng thanh khoản, OB, FVG  
+• Tự động quét đa khung thời gian để phát hiện tín hiệu chất lượng  
+• Hỗ trợ cả Futures & Forex — tiết kiệm thời gian & tăng tỷ lệ win  
+
+📌 *Muốn trải nghiệm bot miễn phí?*  
+👉 Liên hệ ngay: *0399 834 208 (Zalo)* để được cấp quyền truy cập & hướng dẫn sử dụng.
+
+💡 Gõ lệnh /scan BTCUSDT để kiểm tra thử!`;
+
+  bot.sendMessage(chatId, welcome, { parse_mode: 'Markdown' });
 });
 
-bot.onText(/\/scan (.+)/i, async (msg, match) => {
+// ---------------- ADMIN APPROVE USERS ----------------
+bot.onText(/\/approve (.+)/, (msg, match) => {
   const chatId = String(msg.chat.id);
-  const symbol = (match[1] || '').trim().toUpperCase();
-  const r = await fullAnalysis(symbol);
-  if (!r.ok) return bot.sendMessage(chatId, `❌ ${r.reason}`);
-  if (r.idea.ok) {
-    const i = r.idea;
-    bot.sendMessage(chatId, `📊 ${symbol}\n${i.dir}\nEntry:${i.entry}\nSL:${i.sl}\nTP:${i.tp}\nScore:${i.score}\nNote:${i.note}`);
-    pushHistoryRecord({ type: 'manual', symbol, idea: i, user: chatId });
-  } else bot.sendMessage(chatId, `⚠️ ${r.idea.reason}`);
+  if (chatId !== ADMIN_ID) return;
+
+  const userId = match[1].trim();
+  const perms = readJSON(PERMS_FILE, { admins: [ADMIN_ID], users: [] });
+  if (!perms.users.includes(userId)) {
+    perms.users.push(userId);
+    writeJSON(PERMS_FILE, perms);
+    bot.sendMessage(ADMIN_ID, `✅ Đã duyệt user ${userId}`);
+    bot.sendMessage(userId, '✅ Bạn đã được admin phê duyệt, giờ có thể sử dụng bot.');
+  } else {
+    bot.sendMessage(ADMIN_ID, `ℹ️ User ${userId} đã được duyệt trước đó.`);
+  }
+});
+
+// Khi có người lạ nhắn, yêu cầu admin duyệt
+bot.on('message', (msg) => {
+  const userId = String(msg.chat.id);
+  const text = msg.text || '';
+  if (userId === ADMIN_ID || text.startsWith('/')) return;
+
+  const perms = readJSON(PERMS_FILE, { admins: [ADMIN_ID], users: [] });
+  if (!perms.users.includes(userId)) {
+    bot.sendMessage(userId, '🚫 Bạn chưa được admin phê duyệt. Vui lòng liên hệ admin để được cấp quyền.');
+    bot.sendMessage(ADMIN_ID, `👤 User mới yêu cầu truy cập:\nID: ${userId}\nTin nhắn: ${text}\nDuyệt bằng: /approve ${userId}`);
+    return;
+  }
 });
 
 // ---------------- SERVER & START ----------------
@@ -245,66 +294,3 @@ setTimeout(() => {
   autoScanAll();
   setInterval(autoScanAll, AUTO_INTERVAL_MIN * 60000);
 }, 3000);
-// ---------------- BROADCAST MESSAGES ----------------
-
-// Tự động lưu người dùng mới khi họ nhắn với bot
-bot.on('message', (msg) => {
-  const userId = String(msg.chat.id);
-  const perms = readJSON(PERMS_FILE, { admins: [ADMIN_ID], users: [] });
-
-  if (!perms.users.includes(userId) && userId !== ADMIN_ID) {
-    perms.users.push(userId);
-    writeJSON(PERMS_FILE, perms);
-    console.log(`👤 New user added: ${userId}`);
-  }
-});
-
-// Khi admin gửi tin nhắn bắt đầu bằng !broadcast thì gửi cho toàn bộ users
-bot.onText(/^!broadcast (.+)/i, async (msg, match) => {
-  const chatId = String(msg.chat.id);
-  if (chatId !== ADMIN_ID) return;
-
-  const text = match[1];
-  const perms = readJSON(PERMS_FILE, { admins: [ADMIN_ID], users: [] });
-  const allUsers = [ADMIN_ID, ...perms.users];
-
-  let sent = 0;
-  for (const uid of allUsers) {
-    try {
-      await bot.sendMessage(uid, `📢 ${text}`);
-      sent++;
-    } catch (e) {
-      console.warn(`❌ Failed to send to ${uid}`, e.message);
-    }
-  }
-  bot.sendMessage(chatId, `✅ Đã gửi broadcast cho ${sent} người.`);
-});
-
-// ---------------- AUTO BROADCAST MESSAGES ----------------
-
-// Tự động lưu user khi họ nhắn gì đó
-bot.on('message', async (msg) => {
-  const senderId = String(msg.chat.id);
-  const text = msg.text || '';
-  if (!text || text.startsWith('!broadcast')) return; // tránh loop broadcast admin
-
-  const perms = readJSON(PERMS_FILE, { admins: [ADMIN_ID], users: [] });
-
-  // Thêm user mới nếu chưa có
-  if (!perms.users.includes(senderId) && senderId !== ADMIN_ID) {
-    perms.users.push(senderId);
-    writeJSON(PERMS_FILE, perms);
-    console.log(`👤 New user auto-added: ${senderId}`);
-  }
-
-  const allRecipients = [ADMIN_ID, ...perms.users].filter(id => id !== senderId);
-
-  // Forward tin nhắn đến tất cả người khác
-    for (const uid of allRecipients) {
-    try {
-      await bot.sendMessage(uid, `💬 Từ ${senderId}: ${text}`);
-    } catch (e) {
-      console.warn(`❌ Không gửi được tới ${uid}:`, e.message);
-    }
-  }
-});
