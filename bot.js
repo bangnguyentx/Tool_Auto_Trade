@@ -40,7 +40,7 @@ const AUTO_COINS = (process.env.AUTO_COINS || 'LINKUSDT,BTCUSDT,BNBUSDT,SOLUSDT,
 const BOT_NAME = process.env.BOT_NAME || 'Tool_Auto_Trade';
 const ACTIVE_FROM = process.env.ACTIVE_FROM || '0630'; // HHMM
 const ACTIVE_TO = process.env.ACTIVE_TO || '2300';     // HHMM
-const SCORE_THRESHOLD = Number(process.env.SCORE_THRESHOLD || 6);
+const SCORE_THRESHOLD = Number(process.env.SCORE_THRESHOLD || 2);
 const DATA_DIR = path.join(__dirname, '.data');
 
 // validations
@@ -423,6 +423,23 @@ bot.onText(/\/announce\s+(.+)/i, (msg, match) => {
   const users = Array.from(new Set([ADMIN_ID, ...(perms.users||[])]));
   users.forEach((u, i) => setTimeout(()=> { bot.sendMessage(String(u), `📣 Announcement:\n${text}`).catch(()=>{}); }, i * 60));
   bot.sendMessage(ADMIN_ID, `✅ Sent announcement to ${users.length} users.`);
+});
+
+// /listusers - admin only
+bot.onText(/\/listusers/, (msg) => {
+  const from = String(msg.from && msg.from.id);
+  if (from !== ADMIN_ID) return bot.sendMessage(from, '❌ Chỉ admin mới có quyền này.');
+  
+  const perms = readPerms();
+  const admins = perms.admins || [];
+  const users = perms.users || [];
+  
+  let text = `👑 *Admins* (${admins.length}):\n`;
+  text += admins.map(a => ` - ${a}`).join('\n') || '(none)';
+  text += `\n\n👤 *Users* (${users.length}):\n`;
+  text += users.map(u => ` - ${u}`).join('\n') || '(none)';
+  
+  bot.sendMessage(from, text, { parse_mode: 'Markdown' });
 });
 
 // admin immediate broadcast with prefix !broadcast (also accepts admin only)
