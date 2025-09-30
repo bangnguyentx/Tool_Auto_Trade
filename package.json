@@ -1,7 +1,7 @@
 {
   "name": "tool_auto_trade",
   "version": "1.0.0",
-  "description": "Telegram Auto Trade Bot (ICT, Binance Futures)",
+  "description": "AI Telegram Bot for Futures/Forex analysis",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
@@ -10,8 +10,5 @@
     "axios": "^1.7.7",
     "express": "^4.19.2",
     "node-telegram-bot-api": "^0.64.0"
-  },
-  "engines": {
-    "node": ">=18.x"
   }
 }
