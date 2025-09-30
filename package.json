@@ -1,31 +1,14 @@
 {
-  "name": "tool-auto-trade-bot",
+  "name": "tool_auto_trade",
   "version": "1.0.0",
-  "description": "Telegram Auto Trade Analysis Bot",
+  "description": "Telegram Auto Trade Bot (ICT, Binance Futures)",
   "main": "bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "nodemon bot.js"
+    "start": "node bot.js"
   },
   "dependencies": {
-    "axios": "^1.7.4",
+    "axios": "^1.7.7",
     "express": "^4.19.2",
-    "fs-extra": "10.1.0",
-    "node-telegram-bot-api": "0.63.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.0"
-  },
-  "engines": {
-    "node": ">=18.x"
-  },
-  "keywords": [
-    "telegram",
-    "bot",
-    "auto-trade",
-    "crypto",
-    "analysis"
-  ],
-  "author": "",
-  "license": "MIT"
+    "node-telegram-bot-api": "^0.64.0"
+  }
 }
